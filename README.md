@@ -72,9 +72,16 @@ BigwingCRM/
 └── pnpm-workspace.yaml
 ```
 
-## Default Credentials
+## Seed Account Passwords
 
-- **SuperAdmin:** admin@bigwing.in / BigWing@2026
+Before running the main seed, set `SEED_ADMIN_PASSWORD` and
+`SEED_TELECALLER_PASSWORD` in `backend/.env` or the process environment. The
+seed uses those passwords only when creating the corresponding users; it does
+not reset existing users. The senior developer script requires
+`SENIOR_DEVELOPER_PASSWORD`; the Redwing script requires
+`REDWING_ADMIN_PASSWORD` only when creating that user. Set unique passwords
+through a local secret store; scripts fail if a required password is missing.
+See `backend/.env.example` for the variable names.
 
 ## API Endpoints (M1)
 

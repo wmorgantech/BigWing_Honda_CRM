@@ -1,9 +1,23 @@
 import { PrismaClient } from "@prisma/client";
 import bcrypt from "bcrypt";
+import dotenv from "dotenv";
+import path from "path";
 
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
 const prisma = new PrismaClient();
 
+function requiredPassword(name: string): string {
+  const value = process.env[name];
+  if (!value || value.trim().length === 0) {
+    throw new Error(`${name} must be set to a non-empty value before running this seed`);
+  }
+  return value;
+}
+
 async function main() {
+  const adminPasswordValue = requiredPassword("SEED_ADMIN_PASSWORD");
+  const telecallerPasswordValue = requiredPassword("SEED_TELECALLER_PASSWORD");
+
   console.log("🌱 Seeding database...");
 
   // ─── Roles ──────────────────────────────────────────────────────
@@ -30,7 +44,7 @@ async function main() {
 
   // ─── SuperAdmin user ────────────────────────────────────────────
   const adminEmail = "admin@bigwing.in";
-  const adminPassword = await bcrypt.hash("BigWing@2026", 12);
+  const adminPassword = await bcrypt.hash(adminPasswordValue, 12);
   const superAdminRole = await prisma.role.findUnique({
     where: { name: "SUPER_ADMIN" },
   });
@@ -231,7 +245,7 @@ async function main() {
 
   // ─── Requested Telecaller User ──────────────────────────────────
   const reqTeleEmail = "telecaller@example.com";
-  const reqTelePassword = await bcrypt.hash("tele@123", 12);
+  const reqTelePassword = await bcrypt.hash(telecallerPasswordValue, 12);
   const teleRole = await prisma.role.findUnique({ where: { name: "TELE_CALLER" } });
   if (teleRole) {
     await prisma.user.upsert({

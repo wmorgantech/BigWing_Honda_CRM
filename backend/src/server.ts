@@ -120,7 +120,7 @@ app.get("/api/docs/openapi.json", (_req, res) => {
                   required: ["email", "password"],
                   properties: {
                     email: { type: "string", format: "email", example: "admin@bigwing.in" },
-                    password: { type: "string", minLength: 8, example: "BigWing@2026" },
+                    password: { type: "string", minLength: 8 },
                   },
                 },
               },
