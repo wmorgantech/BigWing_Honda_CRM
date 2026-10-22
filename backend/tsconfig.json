@@ -1,0 +1,17 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmitOnError": false,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "paths": {
+      "@bigwing/shared": ["../shared/src"],
+      "@bigwing/db": ["./db/src"]
+    }
+  },
+  "include": ["src/**/*"],
+  "references": [
+    { "path": "../shared" },
+    { "path": "./db" }
+  ]
+}

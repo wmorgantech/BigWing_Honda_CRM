@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+.next/
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Coverage
+coverage/
+
+# Prisma
+packages/db/prisma/*.db
+packages/db/prisma/migrations/*.sql.bak
+
+# Misc
+.turbo/
+*.tsbuildinfo
+
+# Uploads (user-generated files — avatars, Excel imports)
+backend/uploads/*
+!backend/uploads/.gitkeep
+!backend/uploads/avatars/.gitkeep
+
+# Test / scratch files
+backend/test-*.xlsx
+backend/test-*.ts
+backend/errs.xlsx
+backend/errors-report.xlsx
+
+# Claude scratchpad (should not be committed)
+.claude/

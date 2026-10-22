@@ -1,0 +1,1198 @@
+import { prisma } from "@bigwing/db";
+import { leadRepository } from "./repository.js";
+import { customerService } from "../customers/service.js";
+import { customerRepository } from "../customers/repository.js";
+import { AppError } from "../../middlewares/errorHandler.js";
+import { auditService } from "../audit/service.js";
+import { brandContext } from "../../middlewares/brand.js";
+import { userService } from "../users/service.js";
+
+
+// Roles that can see all leads
+export const ALL_DATA_ROLES = ["SUPER_ADMIN", "ADMIN"];
+
+export function ownDataFilter(user?: any): any {
+  if (!user) return { id: -1 };
+  
+  const roles = (user.roles || []).map((r: string) => r.toUpperCase().replace(/\s+/g, "_"));
+  
+  const canSeeAll = roles.some((r: string) => ALL_DATA_ROLES.includes(r));
+  if (canSeeAll) return {};
+
+  const isManager = roles.includes("MANAGER");
+  const isTelecaller = roles.includes("TELE_CALLER") || roles.includes("TELE_CALLER_TELE") || roles.includes("TELE_CALLER_META");
+  const isSalesExec = roles.includes("SALES_EXECUTIVE");
+
+  if (isTelecaller) {
+    // Telecallers can see all leads (like managers/admins)
+    return {};
+  }
+
+  if (isSalesExec) {
+    // Sales executives may see their own leads, assigned leads,
+    // and Meta Facebook leads arriving through the webhook.
+    return {
+      OR: [
+        { createdBy: BigInt(user.userId) },
+        { assignedTo: BigInt(user.userId) },
+        {
+          AND: [
+            { channel: "SOCIAL" },
+            { source: { name: { contains: "facebook", mode: "insensitive" } } },
+          ],
+        },
+      ]
+    };
+  }
+
+  if (isManager) {
+    // Managers see their own leads, what they created, and unassigned leads to manage/assign
+    return {
+      OR: [
+        { createdBy: BigInt(user.userId) },
+        { assignedTo: BigInt(user.userId) },
+        { assignedTo: null }
+      ]
+    };
+  }
+  
+  // Default fallback: only assigned to them
+  return { assignedTo: BigInt(user.userId) };
+}
+
+export class LeadService {
+  async create(data: any, createdBy?: bigint) {
+    // Resolve customer — inline creation or existing
+    let customerId: bigint;
+
+    if (data.customer) {
+      let normalizedMobile = data.customer.mobile;
+      if (normalizedMobile) {
+         normalizedMobile = customerService.normalizeMobile(normalizedMobile);
+      }
+      const existingCustomer = await customerRepository.findByMobile(normalizedMobile);
+      
+      if (existingCustomer) {
+        if (existingCustomer.isDeleted) {
+          await customerRepository.update(existingCustomer.id, { isDeleted: false });
+        }
+        customerId = existingCustomer.id;
+      } else {
+        const customer = await customerService.create(data.customer, createdBy);
+        customerId = BigInt(customer.id);
+      }
+    } else if (data.customerId) {
+      customerId = BigInt(data.customerId);
+      const customer = await customerRepository.findById(customerId);
+      if (!customer || customer.isDeleted) {
+        throw new AppError(
+          404,
+          "CUSTOMER_NOT_FOUND",
+          "Customer not found",
+          "customerId"
+        );
+      }
+    } else {
+      throw new AppError(
+        400,
+        "VALIDATION_ERROR",
+        "Either customerId or customer object is required"
+      );
+    }
+
+    const enquiryNo = await this.generateEnquiryNo();
+
+    const lead = await leadRepository.create({
+      enquiryNo,
+      customer: { connect: { id: customerId } },
+      channel: data.channel,
+      source: { connect: { id: BigInt(data.sourceId) } },
+      enquiryType: { connect: { id: BigInt(data.enquiryTypeId) } },
+      ...(data.purchaseType && { purchaseType: data.purchaseType }),
+      exchangeFlag: data.exchangeFlag ?? false,
+      ...(data.exchangeRemark !== undefined && { exchangeRemark: data.exchangeRemark }),
+      ...(data.modelId && {
+        model: { connect: { id: BigInt(data.modelId) } },
+      }),
+      ...(data.variantId && {
+        variant: { connect: { id: BigInt(data.variantId) } },
+      }),
+      ...(data.colourId && {
+        colour: { connect: { id: BigInt(data.colourId) } },
+      }),
+      ...(data.assignedTo && {
+        assignedUser: { connect: { id: BigInt(data.assignedTo) } },
+      }),
+      ...(data.interestLevel && { interestLevel: data.interestLevel }),
+      testRideFlag: data.testRideFlag ?? false,
+      ...(data.nextFollowupAt && {
+        nextFollowupAt: new Date(data.nextFollowupAt),
+      }),
+      enquiryDate: new Date(data.enquiryDate),
+      ...(data.remark && { remark: data.remark }),
+      ...(data.telecallerRemark && { telecallerRemark: data.telecallerRemark }),
+      ...(data.referredFromBranch && {
+        referredFromBranch: data.referredFromBranch,
+      }),
+      ...(data.executiveName && { executiveName: data.executiveName }),
+      // Service enquiry attributes
+      ...(data.typeOfService && { typeOfService: data.typeOfService }),
+      pickupDropFlag: data.pickupDropFlag ?? false,
+      ...(data.expectedServiceDate && {
+        expectedServiceDate: new Date(data.expectedServiceDate),
+      }),
+      ...(data.metaFormName && { metaFormName: data.metaFormName }),
+      ...(data.metaStatus && { metaStatus: data.metaStatus }),
+      ...(createdBy && {
+        createdByUser: { connect: { id: createdBy } },
+      }),
+    });
+
+    // Reduce stock for the variant if provided
+    if (data.variantId) {
+      await prisma.vehicleVariant.update({
+        where: { id: BigInt(data.variantId) },
+        data: { stock: { decrement: 1 } },
+      }).catch((err: any) => {
+        console.error(`Failed to reduce stock for variant ${data.variantId}:`, err.message);
+      });
+    }
+
+    if (createdBy) {
+      auditService.log({ userId: createdBy, entityType: "lead", entityId: lead.id, action: "CREATE" });
+    }
+
+    return this.formatLead(lead);
+  }
+
+  async list(filters: any, user?: any) {
+    const {
+      page,
+      pageSize,
+      stage,
+      channel,
+      interestLevel,
+      assignedTo,
+      sourceId,
+      modelId,
+      dateFrom,
+      dateTo,
+      referredFromBranch,
+      executiveName,
+      followupSeq,
+      metaForm,
+      contactStatus,
+      hiriseStatus,
+      metaStatus,
+      q,
+    } = filters;
+
+    const where: any = {
+      AND: [
+        { isDeleted: false },
+        ownDataFilter(user),
+        ...(stage ? [{
+          OR: [
+            { stage },
+            ...(stage === "QUOTATION_SHARED" ? [{ stage: "Quotation shared" }, { stage: "QUOTATION SHARED" }] : [])
+          ]
+        }] : []),
+        ...(channel ? [{ channel: { in: channel.split(",") } }] : [{ channel: { not: "SOCIAL" } }]),
+        ...(interestLevel ? [{ interestLevel }] : []),
+        ...(assignedTo ? [{ assignedTo: BigInt(assignedTo) }] : []),
+        ...(executiveName ? [{ executiveName: { contains: executiveName, mode: "insensitive" } }] : []),
+        ...(sourceId ? [{ sourceId: BigInt(sourceId) }] : []),
+        ...(modelId ? [{ modelId: BigInt(modelId) }] : []),
+        ...(referredFromBranch ? [{ referredFromBranch }] : []),
+        ...((dateFrom || dateTo) ? [{
+          enquiryDate: {
+            ...(dateFrom && { gte: new Date(dateFrom) }),
+            ...(dateTo && { lte: new Date(new Date(dateTo).setHours(23, 59, 59, 999)) }),
+          },
+        }] : []),
+        ...(followupSeq ? [{
+          followups: followupSeq === "gt5"
+            ? { some: { seqNo: { gt: 5 } } }
+            : {
+                some: { seqNo: parseInt(followupSeq) },
+                none: { seqNo: { gt: parseInt(followupSeq) } }
+              }
+        }] : []),
+        ...(contactStatus === "CONTACTED" ? [{ stage: "NEW", metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : contactStatus === "NON_CONTACTED" ? [{ stage: "NEW", metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : contactStatus === "COMPLETED" ? [{ stage: { not: "NEW" } }] : []),
+        ...(metaForm ? [{ metaFormName: metaForm }] : []),
+        ...(metaStatus === "__OPEN__" ? [{ metaStatus: null }] : metaStatus === "__NON_CONTACTED__" ? [{ metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : metaStatus === "__CONTACTED__" ? [{ metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : metaStatus ? [{ metaStatus }] : []),
+        ...(hiriseStatus === "ENTERED" ? [{
+          OR: [
+            { dmsEnquiryNo: { not: null } },
+            { customer: { leads: { some: { dmsEnquiryNo: { not: null }, isDeleted: false } } } }
+          ]
+        }] : hiriseStatus === "NOT_ENTERED" ? [{
+          dmsEnquiryNo: null,
+          customer: { leads: { none: { dmsEnquiryNo: { not: null }, isDeleted: false } } }
+        }] : []),
+        ...(q ? [{
+          OR: [
+            { enquiryNo: { contains: q, mode: "insensitive" } },
+            { customer: { firstName: { contains: q, mode: "insensitive" } } },
+            { customer: { lastName: { contains: q, mode: "insensitive" } } },
+            { customer: { mobile: { contains: q } } },
+          ],
+        }] : []),
+      ]
+    };
+
+    let orderBy: any = undefined;
+    if (contactStatus === "CONTACTED") {
+      orderBy = [
+        { nextFollowupAt: { sort: "asc", nulls: "last" } },
+        { enquiryDate: "desc" },
+        { createdAt: "desc" }
+      ];
+    }
+
+    const [leads, total] = await Promise.all([
+      leadRepository.findMany({
+        where,
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        orderBy,
+      }),
+      leadRepository.count(where),
+    ]);
+
+    return {
+      data: leads.map(this.formatLead),
+      meta: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+      },
+    };
+  }
+
+  async getById(id: bigint) {
+    const lead = await leadRepository.findById(id);
+    if (!lead || lead.isDeleted) {
+      throw new AppError(404, "LEAD_NOT_FOUND", "Lead not found");
+    }
+     return await this.formatLeadDetail(lead); 
+  }
+
+  
+async getByPhoneNumber(phoneNo: string) {
+  const leads = await leadRepository.findByCustomerPhone(phoneNo);
+
+  if (!leads || leads.length === 0) {
+    throw new AppError(404, "LEADS_NOT_FOUND", "No leads found");
+  }
+
+  return await Promise.all(
+    leads.map((lead) => this.formatLeadDetail(lead))
+  );
+}
+
+
+  async update(id: bigint, data: any, updatedBy?: bigint) {
+    const existing = await leadRepository.findById(id);
+    if (!existing || existing.isDeleted) {
+      throw new AppError(404, "LEAD_NOT_FOUND", "Lead not found");
+    }
+
+    const updateData: any = {
+      ...(data.sourceId && {
+        source: { connect: { id: BigInt(data.sourceId) } },
+      }),
+      ...(data.enquiryTypeId && {
+        enquiryType: { connect: { id: BigInt(data.enquiryTypeId) } },
+      }),
+      ...(data.purchaseType !== undefined && {
+        purchaseType: data.purchaseType,
+      }),
+      ...(data.exchangeFlag !== undefined && {
+        exchangeFlag: data.exchangeFlag,
+      }),
+      ...(data.exchangeRemark !== undefined && {
+        exchangeRemark: data.exchangeRemark,
+      }),
+      ...(data.modelId && {
+        model: { connect: { id: BigInt(data.modelId) } },
+      }),
+      ...(data.variantId && {
+        variant: { connect: { id: BigInt(data.variantId) } },
+      }),
+      ...(data.colourId && {
+        colour: { connect: { id: BigInt(data.colourId) } },
+      }),
+      ...(data.assignedTo && {
+        assignedUser: { connect: { id: BigInt(data.assignedTo) } },
+      }),
+      ...(data.interestLevel !== undefined && {
+        interestLevel: data.interestLevel,
+      }),
+      ...(data.testRideFlag !== undefined && {
+        testRideFlag: data.testRideFlag,
+      }),
+      ...(data.nextFollowupAt !== undefined && {
+        nextFollowupAt: data.nextFollowupAt
+          ? new Date(data.nextFollowupAt)
+          : null,
+      }),
+      ...(data.enquiryDate && { enquiryDate: new Date(data.enquiryDate) }),
+      ...(data.remark !== undefined && { remark: data.remark }),
+      ...(data.telecallerRemark !== undefined && { telecallerRemark: data.telecallerRemark }),
+      ...(data.referredFromBranch !== undefined && {
+        referredFromBranch: data.referredFromBranch,
+      }),
+      ...(data.executiveName !== undefined && { executiveName: data.executiveName }),
+      ...(data.typeOfService !== undefined && {
+        typeOfService: data.typeOfService,
+      }),
+      ...(data.pickupDropFlag !== undefined && {
+        pickupDropFlag: data.pickupDropFlag,
+      }),
+      ...(data.expectedServiceDate !== undefined && {
+        expectedServiceDate: data.expectedServiceDate
+          ? new Date(data.expectedServiceDate)
+          : null,
+      }),
+      ...(data.metaStatus !== undefined && { metaStatus: data.metaStatus }),
+      ...(updatedBy ? { updatedByUser: { connect: { id: updatedBy } } } : {}),
+      rowVersion: { increment: 1 },
+    };
+
+    const lead = await leadRepository.update(id, updateData);
+
+    if (updatedBy) {
+      auditService.log({ userId: updatedBy, entityType: "lead", entityId: id, action: "UPDATE", changes: data });
+    }
+
+    return this.formatLead(lead);
+  }
+
+  async moveStage(
+    id: bigint,
+    data: { stage: string; closureReasonId?: number; remark?: string },
+    changedBy: bigint
+  ) {
+    const existing = await leadRepository.findById(id);
+    if (!existing || existing.isDeleted) {
+      throw new AppError(404, "LEAD_NOT_FOUND", "Lead not found");
+    }
+
+    if (existing.stage === data.stage) {
+      throw new AppError(400, "SAME_STAGE", "Lead is already in this stage");
+    }
+
+    const updateData: any = {
+      stage: data.stage,
+      ...(changedBy ? { updatedByUser: { connect: { id: changedBy } } } : {}),
+      rowVersion: { increment: 1 },
+    };
+
+    // Terminal stages
+    if (data.stage === "DELIVERED_CLOSED" || data.stage === "LOST") {
+      updateData.closedAt = new Date();
+      if (data.closureReasonId) {
+        updateData.closureReason = {
+          connect: { id: BigInt(data.closureReasonId) },
+        };
+      }
+    }
+
+    if (data.remark) {
+      const stageName = data.stage === "LOST" ? "LOST" : data.stage.replace(/_/g, " ");
+      const newEntry = `[${stageName}] ${data.remark}`;
+      updateData.remark = existing.remark ? `${existing.remark}\n${newEntry}` : newEntry;
+    }
+
+    const [lead] = await prisma.$transaction([
+      prisma.lead.update({
+        where: { id },
+        data: updateData,
+        include: {
+          customer: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              mobile: true,
+            },
+          },
+          source: { select: { id: true, name: true } },
+          enquiryType: { select: { id: true, name: true } },
+          model: { select: { id: true, name: true } },
+          variant: { select: { id: true, name: true } },
+          colour: { select: { id: true, name: true } },
+          assignedUser: { select: { id: true, fullName: true } },
+        },
+      }),
+      prisma.leadStageHistory.create({
+        data: {
+          leadId: id,
+          fromStage: existing.stage,
+          toStage: data.stage,
+          remark: data.remark,
+          changedBy,
+        },
+      }),
+    ]);
+
+    auditService.log({ userId: changedBy, entityType: "lead", entityId: id, action: "UPDATE", changes: { stage: data.stage } });
+
+    return this.formatLead(lead);
+  }
+
+  async assign(id: bigint, assignedTo: number, updatedBy: bigint) {
+    const existing = await leadRepository.findById(id);
+    if (!existing || existing.isDeleted) {
+      throw new AppError(404, "LEAD_NOT_FOUND", "Lead not found");
+    }
+
+    const updateData: any = {
+      ...(updatedBy ? { updatedByUser: { connect: { id: updatedBy } } } : {}),
+      rowVersion: { increment: 1 },
+    };
+
+    if (typeof assignedTo === "number") {
+      updateData.assignedUser = { connect: { id: BigInt(assignedTo) } };
+    } else if (typeof assignedTo === "string") {
+      updateData.executiveName = assignedTo;
+      updateData.assignedTo = null; // Clear system user if assigning to executive by name
+    }
+
+    const lead = await leadRepository.update(id, updateData);
+
+    auditService.log({ userId: updatedBy, entityType: "lead", entityId: id, action: "UPDATE", changes: { assignedTo } });
+
+    return this.formatLead(lead);
+  }
+
+  async getFollowupView(
+    view: "today" | "overdue" | "upcoming" | "no-followup" | "booked" | "active",
+    filters: any,
+    user?: any
+  ) {
+    const now = new Date();
+    const todayStart = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate()
+    );
+    const todayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+
+    const {
+      page,
+      pageSize,
+      stage,
+      channel,
+      interestLevel,
+      assignedTo,
+      executiveName,
+      sourceId,
+      modelId,
+      referredFromBranch,
+      dateFrom,
+      dateTo,
+      followupSeq,
+      metaForm,
+      hiriseStatus,
+      metaStatus,
+      contactStatus,
+      q,
+    } = filters;
+
+    const where: any = {
+      AND: [
+        { isDeleted: false },
+        ...(stage ? [{
+          OR: [
+            { stage },
+            ...(stage === "QUOTATION_SHARED" ? [{ stage: "Quotation shared" }, { stage: "QUOTATION SHARED" }] : [])
+          ]
+        }] : [{
+          stage: view === "booked" ? "BOOKED" : { notIn: ["BOOKED", "INVOICED", "DELIVERED_CLOSED", "LOST"] }
+        }]),
+        ownDataFilter(user),
+        ...(channel ? [{ channel: { in: channel.split(",") } }] : [{ channel: { not: "SOCIAL" } }]), // Trigger reload
+        ...(interestLevel ? [{ interestLevel }] : []),
+        ...(assignedTo ? [{ assignedTo: BigInt(assignedTo) }] : []),
+        ...(executiveName ? [{ executiveName: { contains: executiveName, mode: "insensitive" } }] : []),
+        ...(sourceId ? [{ sourceId: BigInt(sourceId) }] : []),
+        ...(modelId ? [{ modelId: BigInt(modelId) }] : []),
+        ...(referredFromBranch ? [{ referredFromBranch }] : []),
+        ...((dateFrom || dateTo) ? [{
+          enquiryDate: {
+            ...(dateFrom && { gte: new Date(dateFrom) }),
+            ...(dateTo && { lte: new Date(new Date(dateTo).setHours(23, 59, 59, 999)) }),
+          },
+        }] : []),
+        ...(followupSeq ? [{
+          followups: followupSeq === "gt5"
+            ? { some: { seqNo: { gt: 5 } } }
+            : {
+                some: { seqNo: parseInt(followupSeq) },
+                none: { seqNo: { gt: parseInt(followupSeq) } }
+              }
+        }] : []),
+        ...(metaForm ? [{ metaFormName: metaForm }] : []),
+        ...(metaStatus === "__OPEN__" ? [{ metaStatus: null }] : metaStatus === "__NON_CONTACTED__" ? [{ metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : metaStatus === "__CONTACTED__" ? [{ metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : metaStatus ? [{ metaStatus }] : []),
+        ...(contactStatus === "CONTACTED" ? [{ stage: "NEW", metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : contactStatus === "NON_CONTACTED" ? [{ stage: "NEW", metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : contactStatus === "COMPLETED" ? [{ stage: { not: "NEW" } }] : []),
+        ...(hiriseStatus === "ENTERED" ? [{
+          OR: [
+            { dmsEnquiryNo: { not: null } },
+            { customer: { leads: { some: { dmsEnquiryNo: { not: null }, isDeleted: false } } } }
+          ]
+        }] : hiriseStatus === "NOT_ENTERED" ? [{
+          dmsEnquiryNo: null,
+          customer: { leads: { none: { dmsEnquiryNo: { not: null }, isDeleted: false } } }
+        }] : []),
+        ...(q ? [{
+          OR: [
+            { enquiryNo: { contains: q, mode: "insensitive" } },
+            { customer: { firstName: { contains: q, mode: "insensitive" } } },
+            { customer: { lastName: { contains: q, mode: "insensitive" } } },
+            { customer: { mobile: { contains: q } } },
+          ],
+        }] : []),
+      ]
+    };
+
+    const conditions = where.AND as any[];
+
+    switch (view) {
+      case "today":
+        conditions.push({ nextFollowupAt: { gte: todayStart, lt: todayEnd } });
+        break;
+      case "overdue":
+        conditions.push({ nextFollowupAt: { lt: todayStart } });
+        break;
+      case "upcoming":
+        conditions.push({ nextFollowupAt: { gte: todayEnd } });
+        break;
+      case "no-followup":
+        conditions.push({ nextFollowupAt: null });
+        break;
+      case "booked":
+      case "active":
+        // Stage filter handled above
+        break;
+    }
+
+    let orderBy: any = undefined;
+    if (["today", "upcoming", "overdue"].includes(view) || contactStatus === "CONTACTED") {
+      orderBy = [
+        { nextFollowupAt: { sort: "asc", nulls: "last" } },
+        { enquiryDate: "desc" },
+        { createdAt: "desc" }
+      ];
+    }
+
+    const [leads, total] = await Promise.all([
+      leadRepository.findMany({
+        where,
+        skip: (page - 1) * pageSize,
+        take: pageSize,
+        orderBy,
+      }),
+      leadRepository.count(where),
+    ]);
+
+    return {
+      data: leads.map(this.formatLead),
+      meta: {
+        page,
+        pageSize,
+        total,
+        totalPages: Math.ceil(total / pageSize),
+      },
+    };
+  }
+
+  async exportExcel(
+    view: string,
+    filters: any,
+    user?: any
+  ) {
+    let leads: any[] = [];
+    
+    if (view === "all" || view.startsWith("meta") || view === "service") {
+      const {
+        stage,
+        channel,
+        interestLevel,
+        assignedTo,
+        sourceId,
+        modelId,
+        referredFromBranch,
+        executiveName,
+        followupSeq,
+        metaForm,
+        contactStatus,
+        hiriseStatus,
+        metaStatus,
+        q,
+      } = filters;
+
+      const where: any = {
+        AND: [
+          { isDeleted: false },
+          ownDataFilter(user),
+          ...(stage ? [{
+          OR: [
+            { stage },
+            ...(stage === "QUOTATION_SHARED" ? [{ stage: "Quotation shared" }, { stage: "QUOTATION SHARED" }] : [])
+          ]
+        }] : []),
+          ...(channel ? [{ channel: { in: channel.split(",") } }] : [{ channel: { not: "SOCIAL" } }]),
+          ...(interestLevel ? [{ interestLevel }] : []),
+          ...(assignedTo ? [{ assignedTo: BigInt(assignedTo) }] : []),
+          ...(executiveName ? [{ executiveName: { contains: executiveName, mode: "insensitive" } }] : []),
+          ...(sourceId ? [{ sourceId: BigInt(sourceId) }] : []),
+          ...(modelId ? [{ modelId: BigInt(modelId) }] : []),
+          ...(referredFromBranch ? [{ referredFromBranch }] : []),
+          ...(followupSeq ? [{
+            followups: followupSeq === "gt5"
+              ? { some: { seqNo: { gt: 5 } } }
+              : {
+                  some: { seqNo: parseInt(followupSeq) },
+                  none: { seqNo: { gt: parseInt(followupSeq) } }
+                }
+          }] : []),
+          ...(contactStatus === "CONTACTED" ? [{ stage: "NEW", metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : contactStatus === "NON_CONTACTED" ? [{ stage: "NEW", metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : contactStatus === "COMPLETED" ? [{ stage: { not: "NEW" } }] : []),
+          ...(metaForm ? [{ metaFormName: metaForm }] : []),
+          ...(metaStatus === "__OPEN__" ? [{ metaStatus: null }] : metaStatus === "__NON_CONTACTED__" ? [{ metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : metaStatus === "__CONTACTED__" ? [{ metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : metaStatus ? [{ metaStatus }] : []),
+          ...(hiriseStatus === "ENTERED" ? [{
+            OR: [
+              { dmsEnquiryNo: { not: null } },
+              { customer: { leads: { some: { dmsEnquiryNo: { not: null }, isDeleted: false } } } }
+            ]
+          }] : hiriseStatus === "NOT_ENTERED" ? [{
+            dmsEnquiryNo: null,
+            customer: { leads: { none: { dmsEnquiryNo: { not: null }, isDeleted: false } } }
+          }] : []),
+          ...((filters.dateFrom || filters.dateTo) ? [{
+            enquiryDate: {
+              ...(filters.dateFrom && { gte: new Date(filters.dateFrom) }),
+              ...(filters.dateTo && { lte: new Date(new Date(filters.dateTo).setHours(23, 59, 59, 999)) }),
+            },
+          }] : []),
+          ...(q ? [{
+            OR: [
+              { enquiryNo: { contains: q, mode: "insensitive" } },
+              { customer: { firstName: { contains: q, mode: "insensitive" } } },
+              { customer: { lastName: { contains: q, mode: "insensitive" } } },
+              { customer: { mobile: { contains: q } } },
+            ],
+          }] : []),
+        ]
+      };
+      
+      let orderBy: any = undefined;
+      if (contactStatus === "CONTACTED") {
+        orderBy = [
+          { nextFollowupAt: { sort: "asc", nulls: "last" } },
+          { enquiryDate: "desc" },
+          { createdAt: "desc" }
+        ];
+      }
+      leads = await leadRepository.findManyForExport({ where, orderBy });
+    } else {
+      const now = new Date();
+      const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const todayEnd = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
+
+      const {
+        stage,
+        channel,
+        interestLevel,
+        assignedTo,
+        sourceId,
+        modelId,
+        referredFromBranch,
+        executiveName,
+        followupSeq,
+        metaForm,
+        contactStatus,
+        hiriseStatus,
+        metaStatus,
+        dateFrom,
+        dateTo,
+        q,
+      } = filters;
+
+      const where: any = {
+        AND: [
+          { isDeleted: false },
+          ...(stage ? [{
+            OR: [
+              { stage },
+              ...(stage === "QUOTATION_SHARED" ? [{ stage: "Quotation shared" }, { stage: "QUOTATION SHARED" }] : [])
+            ]
+          }] : [{
+            stage: view === "booked" ? "BOOKED" : { notIn: ["BOOKED", "INVOICED", "DELIVERED_CLOSED", "LOST"] }
+          }]),
+          ownDataFilter(user),
+          ...(channel ? [{ channel: { in: channel.split(",") } }] : [{ channel: { not: "SOCIAL" } }]),
+          ...(interestLevel ? [{ interestLevel }] : []),
+          ...(assignedTo ? [{ assignedTo: BigInt(assignedTo) }] : []),
+          ...(executiveName ? [{ executiveName: { contains: executiveName, mode: "insensitive" } }] : []),
+          ...(sourceId ? [{ sourceId: BigInt(sourceId) }] : []),
+          ...(modelId ? [{ modelId: BigInt(modelId) }] : []),
+          ...(referredFromBranch ? [{ referredFromBranch }] : []),
+          ...(followupSeq ? [{
+            followups: followupSeq === "gt5"
+              ? { some: { seqNo: { gt: 5 } } }
+              : {
+                  some: { seqNo: parseInt(followupSeq) },
+                  none: { seqNo: { gt: parseInt(followupSeq) } }
+                }
+          }] : []),
+          ...(contactStatus === "CONTACTED" ? [{ stage: "NEW", metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : contactStatus === "NON_CONTACTED" ? [{ stage: "NEW", metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : contactStatus === "COMPLETED" ? [{ stage: { not: "NEW" } }] : []),
+          ...(metaForm ? [{ metaFormName: metaForm }] : []),
+          ...(metaStatus === "__OPEN__" ? [{ metaStatus: null }] : metaStatus === "__NON_CONTACTED__" ? [{ metaStatus: { in: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] } }] : metaStatus === "__CONTACTED__" ? [{ metaStatus: { notIn: ["RNR", "Switched OFF", "Wrong Number", "Number Busy", "Busy", "Not Reachable"] }, NOT: { metaStatus: null } }] : metaStatus ? [{ metaStatus }] : []),
+          ...(hiriseStatus === "ENTERED" ? [{
+            OR: [
+              { dmsEnquiryNo: { not: null } },
+              { customer: { leads: { some: { dmsEnquiryNo: { not: null }, isDeleted: false } } } }
+            ]
+          }] : hiriseStatus === "NOT_ENTERED" ? [{
+            dmsEnquiryNo: null,
+            customer: { leads: { none: { dmsEnquiryNo: { not: null }, isDeleted: false } } }
+          }] : []),
+          ...((dateFrom || dateTo) ? [{
+            enquiryDate: {
+              ...(dateFrom && { gte: new Date(dateFrom) }),
+              ...(dateTo && { lte: new Date(new Date(dateTo).setHours(23, 59, 59, 999)) }),
+            },
+          }] : []),
+          ...(q ? [{
+            OR: [
+              { enquiryNo: { contains: q, mode: "insensitive" } },
+              { customer: { firstName: { contains: q, mode: "insensitive" } } },
+              { customer: { lastName: { contains: q, mode: "insensitive" } } },
+              { customer: { mobile: { contains: q } } },
+            ],
+          }] : []),
+        ]
+      };
+
+      const conditions = where.AND as any[];
+
+      switch (view) {
+        case "today":
+          conditions.push({ nextFollowupAt: { gte: todayStart, lt: todayEnd } });
+          break;
+        case "overdue":
+          conditions.push({ nextFollowupAt: { lt: todayStart } });
+          break;
+        case "upcoming":
+          conditions.push({ nextFollowupAt: { gte: todayEnd } });
+          break;
+        case "no-followup":
+          conditions.push({ nextFollowupAt: null });
+          break;
+      }
+      
+      let orderBy: any = undefined;
+      if (["today", "upcoming", "overdue"].includes(view) || contactStatus === "CONTACTED") {
+        orderBy = [
+          { nextFollowupAt: { sort: "asc", nulls: "last" } },
+          { enquiryDate: "desc" },
+          { createdAt: "desc" }
+        ];
+      }
+      leads = await leadRepository.findManyForExport({ where, orderBy });
+    }
+
+    const formatted = leads.map(this.formatLead);
+
+    // Create Excel
+    const XLSX = await import("xlsx");
+    const workbook = XLSX.utils.book_new();
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    // Find max followup count across all leads for column generation
+    const maxFollowups = leads.reduce((max: number, l: any) => Math.max(max, l.followups?.length ?? 0), 0);
+
+    const data = formatted.map((l, idx) => {
+      // Check for WhatsApp/Campaign format
+      const isWhatsapp = String(filters?.format || "").toLowerCase() === "whatsapp";
+      
+      if (isWhatsapp) {
+        return {
+          "Customer Name": `${l.customer?.firstName} ${l.customer?.lastName ?? ""}`.trim(),
+          "Phone Number": l.customer?.mobile || "N/A",
+        };
+      }
+
+      // Calculate overdue days
+      const nextDate = l.nextFollowupAt ? new Date(l.nextFollowupAt) : null;
+      let overdueDays = 0;
+      if (nextDate && nextDate < todayStart) {
+        const nextDateStart = new Date(nextDate.getFullYear(), nextDate.getMonth(), nextDate.getDate());
+        overdueDays = Math.round((todayStart.getTime() - nextDateStart.getTime()) / (1000 * 60 * 60 * 24));
+      }
+
+      const stageMap: Record<string, string> = {
+        NEW: "NEW",
+        NOT_CONTACTED: "NEW",
+        ENQUIRED: "ENQUIRY",
+        CONTACTED: "ENQUIRY",
+        NOT_REACHABLE: "NOT REACHABLE",
+        TEST_RIDE_SCHEDULED: "TEST RIDE SCHEDULED",
+        TEST_RIDE_COMPLETED: "TEST RIDE COMPLETED",
+        QUOTATION_SHARED: "QUOTATION SHARED",
+        BOOKED: "BOOKED",
+        INVOICED: "INVOICED",
+        DELIVERED_CLOSED: "DELIVERED",
+        LOST: "LOST",
+      };
+
+      const isTeleMeta = view.startsWith("meta") || String(filters?.channel || "").includes("TELE") || String(filters?.channel || "").includes("SOCIAL");
+      const hiriseEntered = Boolean(l.dmsEnquiryNo || l.linkedDmsEnquiryNo);
+
+      // Build F1, F2, F3... columns from raw leads followups
+      const rawFollowups: any[] = (leads[idx] as any)?.followups ?? [];
+      const followupCols: Record<string, string> = {};
+      for (let i = 0; i < maxFollowups; i++) {
+        const f = rawFollowups[i];
+        const n = i + 1;
+        if (f) {
+          followupCols[`F${n} Date`] = f.followupDate ? new Date(f.followupDate).toLocaleDateString("en-IN") : "";
+          followupCols[`F${n} Channel`] = f.channel || "";
+          followupCols[`F${n} Outcome`] = f.outcome || "";
+          followupCols[`F${n} Remark`] = f.remark || "";
+          followupCols[`F${n} Next Action`] = f.nextActionAt ? new Date(f.nextActionAt).toLocaleDateString("en-IN") : "";
+        } else {
+          followupCols[`F${n} Date`] = "";
+          followupCols[`F${n} Channel`] = "";
+          followupCols[`F${n} Outcome`] = "";
+          followupCols[`F${n} Remark`] = "";
+          followupCols[`F${n} Next Action`] = "";
+        }
+      }
+
+      const common = {
+        "S.No": idx + 1,
+        "Enquiry No": l.enquiryNo,
+        "Customer Name": `${l.customer?.firstName} ${l.customer?.lastName ?? ""}`.trim(),
+        "Mobile": l.customer?.mobile,
+        "Model": l.model || "",
+        "Stage": stageMap[l.stage] || l.stage?.replace(/_/g, " "),
+        "Interest": l.interestLevel || "",
+        "Assigned To": l.assignedTo?.fullName || l.executiveName || "Unassigned",
+        "Branch": l.referredFromBranch || "",
+        "Source": l.source || "",
+        "Channel": l.channel || "",
+        "Enquiry Date": l.enquiryDate ? new Date(l.enquiryDate).toLocaleDateString("en-IN") : "",
+        "Created At": l.createdAt ? new Date(l.createdAt).toLocaleString("en-IN") : "",
+        "Updated By": l.updatedByUsername || "",
+      };
+
+      if (view === "all" || view.startsWith("meta") || view === "service") {
+        return {
+          ...common,
+          ...(isTeleMeta && {
+            "Call Status": l.metaStatus || "Open",
+            "Meta Form": l.metaFormName || "",
+            "Hirise Status": hiriseEntered ? "Entered" : "Not Entered",
+            "Hirise Enquiry No": l.dmsEnquiryNo || l.linkedDmsEnquiryNo || "",
+          }),
+          "Next Follow-up": l.nextFollowupAt ? new Date(l.nextFollowupAt).toLocaleString("en-IN") : "None",
+          "Last Follow-up": l.lastFollowupAt ? new Date(l.lastFollowupAt).toLocaleString("en-IN") : "None",
+          "Telecaller Remark": l.telecallerRemark || "",
+          "Follow-up Remark": l.latestFollowupRemark || "",
+          "Remarks": l.remark || "",
+          ...followupCols,
+        };
+      } else {
+        return {
+          ...common,
+          ...(isTeleMeta && {
+            "Call Status": l.metaStatus || "Open",
+            "Meta Form": l.metaFormName || "",
+            "Hirise Status": hiriseEntered ? "Entered" : "Not Entered",
+            "Hirise Enquiry No": l.dmsEnquiryNo || l.linkedDmsEnquiryNo || "",
+          }),
+          "Last Follow-up": l.lastFollowupAt ? new Date(l.lastFollowupAt).toLocaleString("en-IN") : "None",
+          "Next Follow-up": l.nextFollowupAt ? new Date(l.nextFollowupAt).toLocaleString("en-IN") : "None",
+          ...(view === "overdue" && { "Overdue Days": overdueDays }),
+          "Telecaller Remark": l.telecallerRemark || "",
+          "Follow-up Remark": l.latestFollowupRemark || "",
+          "Remarks": l.remark || "",
+          ...followupCols,
+        };
+      }
+    });
+
+    const sheet = XLSX.utils.json_to_sheet(data);
+
+    // Bold header row
+    const range = XLSX.utils.decode_range(sheet["!ref"] || "A1");
+    for (let C = range.s.c; C <= range.e.c; C++) {
+      const cellAddr = XLSX.utils.encode_cell({ r: 0, c: C });
+      if (sheet[cellAddr]) {
+        sheet[cellAddr].s = { font: { bold: true }, fill: { fgColor: { rgb: "1F3864" } }, fontColor: { rgb: "FFFFFF" } };
+      }
+    }
+    
+    // Set column widths based on view/format
+    let widths = [];
+    if (String(filters?.format || "").toLowerCase() === "whatsapp") {
+      widths = [
+        { wch: 35 }, // Customer Name
+        { wch: 20 }, // Phone Number
+      ];
+    } else {
+      const isTeleMetaView = view.startsWith("meta") || String(filters?.channel || "").includes("TELE") || String(filters?.channel || "").includes("SOCIAL");
+      widths = [
+        { wch: 6  }, // S.No
+        { wch: 18 }, // Enquiry No
+        { wch: 28 }, // Customer Name
+        { wch: 16 }, // Mobile
+        { wch: 18 }, // Model
+        { wch: 20 }, // Stage
+        { wch: 10 }, // Interest
+        { wch: 22 }, // Assigned To
+        { wch: 18 }, // Branch
+        { wch: 18 }, // Source
+        { wch: 12 }, // Channel
+        { wch: 14 }, // Enquiry Date
+        { wch: 20 }, // Created At
+        { wch: 18 }, // Updated By
+        ...(isTeleMetaView ? [
+          { wch: 20 }, // Call Status
+          { wch: 30 }, // Meta Form
+          { wch: 16 }, // Hirise Status
+          { wch: 20 }, // Hirise Enquiry No
+        ] : []),
+        { wch: 20 }, // Next/Last Follow-up
+        { wch: 20 }, // Last/Next Follow-up
+        ...(view === "overdue" ? [{ wch: 14 }] : []),
+        { wch: 40 }, // Telecaller Remark
+        { wch: 40 }, // Follow-up Remark
+        { wch: 40 }, // Remarks
+        // F1, F2... dynamic followup columns (5 cols each)
+        ...Array.from({ length: maxFollowups }, () => [
+          { wch: 14 }, // Date
+          { wch: 12 }, // Channel
+          { wch: 16 }, // Outcome
+          { wch: 40 }, // Remark
+          { wch: 14 }, // Next Action
+        ]).flat(),
+      ];
+    }
+    sheet["!cols"] = widths;
+
+    XLSX.utils.book_append_sheet(workbook, sheet, "Leads");
+
+    return XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+  }
+
+  async softDelete(id: bigint, deletedBy: bigint) {
+    const existing = await leadRepository.findById(id);
+    if (!existing || existing.isDeleted) {
+      throw new AppError(404, "LEAD_NOT_FOUND", "Lead not found");
+    }
+
+    await leadRepository.update(id, {
+      isDeleted: true,
+      updatedBy: deletedBy,
+      rowVersion: { increment: 1 },
+    });
+
+    auditService.log({ userId: deletedBy, entityType: "lead", entityId: id, action: "DELETE" });
+
+    return { message: "Lead deleted" };
+  }
+
+  // ─── Helpers ──────────────────────────────────────────────────
+
+  private async generateEnquiryNo(): Promise<string> {
+    const brand = brandContext.getStore() || "BIGWING";
+    const brandPrefix = brand === "REDWING" ? "RW" : "BW";
+    
+    const now = new Date();
+    const yearMonth = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const prefix = `${brandPrefix}-${yearMonth}-`;
+
+    const lastNo = await leadRepository.getLastEnquiryNoForMonth(prefix);
+
+
+    let seq = 1;
+    if (lastNo) {
+      const lastSeq = parseInt(lastNo.split("-").pop()!, 10);
+      seq = lastSeq + 1;
+    }
+
+    return `${prefix}${String(seq).padStart(5, "0")}`;
+  }
+
+  private formatLead(l: any) {
+    let linkedDmsEnquiryNo = null;
+    let linkedDmsEnquiryDate = null;
+    if (!l.dmsEnquiryNo && l.customer?.leads?.length > 0) {
+      linkedDmsEnquiryNo = l.customer.leads[0].dmsEnquiryNo;
+      linkedDmsEnquiryDate = l.customer.leads[0].enquiryDate;
+    }
+
+    return {
+      id: Number(l.id),
+      enquiryNo: l.enquiryNo,
+      customer: l.customer
+        ? {
+            id: Number(l.customer.id),
+            firstName: l.customer.firstName,
+            lastName: l.customer.lastName,
+            mobile: l.customer.mobile,
+          }
+        : undefined,
+      channel: l.channel,
+      source: l.source?.name,
+      enquiryType: l.enquiryType?.name,
+      purchaseType: l.purchaseType,
+      exchangeFlag: l.exchangeFlag,
+      model: l.model?.name,
+      variant: l.variant?.name,
+      colour: l.colour?.name,
+      assignedTo: l.assignedUser
+        ? { id: Number(l.assignedUser.id), fullName: l.assignedUser.fullName }
+        : null,
+      createdByUsername: l.createdByUser?.username,
+      updatedByUsername: l.updatedByUser?.username,
+      followupSeq: l._count?.followups ?? 0,
+      stage: l.stage,
+      interestLevel: l.interestLevel,
+      testRideFlag: l.testRideFlag,
+      nextFollowupAt: l.nextFollowupAt,
+      lastFollowupAt: l.lastFollowupAt,
+      enquiryDate: l.enquiryDate,
+      closedAt: l.closedAt,
+      remark: l.remark,
+      telecallerRemark: l.telecallerRemark,
+      latestFollowupRemark: l.followups?.[0]?.remark || null,
+      executiveName: l.executiveName,
+      referredFromBranch: l.referredFromBranch,
+      typeOfService: l.typeOfService,
+      pickupDropFlag: l.pickupDropFlag,
+      expectedServiceDate: l.expectedServiceDate,
+      metaFormName: l.metaFormName,
+      metaStatus: l.metaStatus,
+      dmsEnquiryNo: l.dmsEnquiryNo,
+      linkedDmsEnquiryNo: linkedDmsEnquiryNo,
+      linkedDmsEnquiryDate: linkedDmsEnquiryDate,
+      isDeleted: l.isDeleted,
+      createdAt: l.createdAt,
+      updatedAt: l.updatedAt,
+    };
+  }
+
+private async formatLeadDetail(l: any) {
+
+  // 🔥 Fetch createdBy user only
+  const createdByUser = l.createdBy
+    ? await userService.getById(l.createdBy)
+    : null;
+
+  let linkedDmsEnquiryNo: string | null = null;
+  let linkedDmsEnquiryDate: Date | null = null;
+  if (!l.dmsEnquiryNo && l.customerId) {
+    const dmsLead = await prisma.lead.findFirst({
+      where: { customerId: l.customerId, dmsEnquiryNo: { not: null }, id: { not: l.id }, isDeleted: false },
+      select: { dmsEnquiryNo: true, enquiryDate: true }
+    });
+    if (dmsLead) {
+      linkedDmsEnquiryNo = dmsLead.dmsEnquiryNo;
+      linkedDmsEnquiryDate = dmsLead.enquiryDate;
+    }
+  }
+
+  const leadDetail = {
+    ...this.formatLead(l),
+
+    // ✅ ONLY USER DATA
+    createdBy: createdByUser
+      ? {
+          id: Number(createdByUser.id),
+          fullName: createdByUser.fullName,
+         roles: createdByUser.roles,
+        }
+      : null,
+
+    dmsEnquiryNo: l.dmsEnquiryNo,
+    linkedDmsEnquiryNo,
+    linkedDmsEnquiryDate,
+    closureReason: l.closureReason?.name,
+
+     colour: l.colour
+    ? {
+        id: Number(l.colour.id),
+        name: l.colour.name,
+      }
+    : null,
+
+    // ❌ REMOVED CUSTOMER
+
+    assignedTo: l.assignedUser
+      ? {
+          id: Number(l.assignedUser.id),
+          fullName: l.assignedUser.fullName,
+          email: l.assignedUser.email,
+        }
+      : null,
+
+    followups:
+      l.followups?.map((f: any) => ({
+        id: Number(f.id),
+        seqNo: f.seqNo,
+        followupDate: f.followupDate,
+        channel: f.channel,
+        remark: f.remark,
+        outcome: f.outcome,
+        nextActionAt: f.nextActionAt,
+        createdBy: f.creator
+          ? { id: Number(f.creator.id), fullName: f.creator.fullName }
+          : null,
+        createdAt: f.createdAt,
+      })) ?? [],
+
+    stageHistory:
+      l.stageHistory?.map((h: any) => ({
+        id: Number(h.id),
+        fromStage: h.fromStage,
+        toStage: h.toStage,
+        remark: h.remark,
+        changedBy: Number(h.changedBy),
+        changedAt: h.changedAt,
+      })) ?? [],
+  };
+
+  console.log("Formatted Lead Detail:", leadDetail);
+
+  return leadDetail;
+}
+  async truncateMeta(deletedBy: bigint) {
+    const brand = brandContext.getStore() || "BIGWING";
+    const result = await prisma.lead.updateMany({
+      where: { channel: "SOCIAL", brand },
+      data: { isDeleted: true, updatedBy: deletedBy, rowVersion: { increment: 1 } },
+    });
+    auditService.log({ userId: deletedBy, entityType: "lead", entityId: BigInt(0), action: "DELETE" });
+    return { message: `Truncated ${result.count} Meta leads` };
+  }
+
+  async getMetaForms() {
+    const brand = brandContext.getStore() || "BIGWING";
+    const leads = await prisma.lead.findMany({
+      where: { channel: "SOCIAL", brand, metaFormName: { not: null } },
+      select: { metaFormName: true },
+      distinct: ['metaFormName']
+    });
+
+    return leads.map(l => l.metaFormName).filter(Boolean);
+  }
+}
+
+export const leadService = new LeadService();

@@ -1,0 +1,136 @@
+import { Request, Response, NextFunction } from "express";
+import { importService } from "./service.js";
+import { brandContext } from "../../middlewares/brand.js";
+
+export class ImportController {
+  async upload(req: Request, res: Response, next: NextFunction) {
+    try {
+      if (!req.file) {
+        res.status(400).json({
+          success: false,
+          error: { code: "NO_FILE", message: "No file uploaded" },
+        });
+        return;
+      }
+
+      const createdBy = BigInt(req.user!.userId);
+      const brand = (req.query.brand as string || (req as any).brand || "BIGWING").toUpperCase();
+      const result = await importService.upload(
+        req.file.path,
+        req.file.filename,
+        createdBy,
+        brand
+      );
+      res.status(201).json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async preview(req: Request, res: Response, next: NextFunction) {
+    try {
+      const batchId = BigInt(req.params.id as string);
+      const sheetName = req.query.sheet as string | undefined;
+      const result = await importService.preview(batchId, sheetName);
+      res.json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async commit(req: Request, res: Response, next: NextFunction) {
+    try {
+      const batchId = BigInt(req.params.id as string);
+      const sheetName = req.query.sheet as string | undefined;
+      const channel = req.query.channel as string | undefined;
+      
+      const brand = brandContext.getStore() || "BIGWING";
+
+      // Return immediately and process in background
+      setImmediate(() => {
+        brandContext.run(brand, () => {
+          importService.commit(batchId, sheetName, channel).catch(err => {
+            console.error(`[Import] Background commit failed for batch ${batchId}:`, err);
+          });
+        });
+      });
+
+      res.json({ 
+        success: true, 
+        message: "Import started in background",
+        data: { batchId: Number(batchId), status: "PROCESSING" }
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async downloadErrors(req: Request, res: Response, next: NextFunction) {
+    try {
+      const batchId = BigInt(req.params.id as string);
+      const buffer = await importService.getErrors(batchId);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="import-errors-${req.params.id}.xlsx"`
+      );
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.send(buffer);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async getActiveBatch(req: Request, res: Response, next: NextFunction) {
+    try {
+      const result = await importService.getActiveBatch();
+      res.json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async cancel(req: Request, res: Response, next: NextFunction) {
+    try {
+      const batchId = BigInt(req.params.id as string);
+      const result = await importService.cancel(batchId);
+      res.json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async getHistory(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { importRepository } = await import("./repository.js");
+      const result = await importRepository.getHistory();
+      const mapped = result.map(b => ({
+        ...b,
+        id: Number(b.id),
+        createdBy: Number(b.createdBy),
+      }));
+      res.json({ success: true, data: mapped });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  async downloadOriginalFile(req: Request, res: Response, next: NextFunction) {
+    try {
+      const batchId = BigInt(req.params.id as string);
+      const { importRepository } = await import("./repository.js");
+      const batch = await importRepository.findBatchById(batchId);
+      if (!batch) {
+        res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Batch not found" } });
+        return;
+      }
+      res.download(`uploads/${batch.fileName}`);
+    } catch (err) {
+      next(err);
+    }
+  }
+}
+
+export const importController = new ImportController();
