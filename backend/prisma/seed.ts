@@ -202,7 +202,15 @@ async function main() {
   console.log(`  ✅ ${colours.length} vehicle colours seeded`);
 
   // ─── Referred Branches (master.referred_branch) ─────────────────
-  const branches = [
+  const branches: {
+    displayOrder: number;
+    name: string;
+    branchName: string;
+    networkCode: string;
+    networkType: string;
+    inventoryLocation: string;
+    brand?: string;
+  }[] = [
     { displayOrder: 1, name: "Bommanahalli", branchName: "Bommanahalli", networkCode: "KA010008", networkType: "MAIN DEALER", inventoryLocation: "HMSI-PARTS-S-KA-KA010008-HEAD BRANCH-ANANDA HONDA" },
     { displayOrder: 2, name: "Hosa Road", branchName: "Hosa Road", networkCode: "KA01BD08", networkType: "BRANCH", inventoryLocation: "HMSI-PARTS-S-KA-KA01BD08-HOSA ROAD-ANDHON" },
     { displayOrder: 3, name: "Sarjapura", branchName: "Sarjapura", networkCode: "KA01BB08", networkType: "BRANCH", inventoryLocation: "HMSI-PARTS-S-KA-KA01BB08-SARJPURA-ANDHON" },

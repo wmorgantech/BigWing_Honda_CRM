@@ -21,6 +21,7 @@ import { taskRoutes } from "./modules/tasks/routes.js";
 import { profileRoutes } from "./modules/profile/routes.js";
 import { adminRoutes } from "./modules/admin/routes.js";
 import { webhookRoutes } from "./modules/webhooks/routes.js";
+import { publicAvatarDirectory } from "./config/uploads.js";
 
 // Connect DB to brand context
 setBrandGetter(() => brandContext.getStore());
@@ -91,7 +92,10 @@ app.use("/api/v1/admin", adminRoutes);
 app.use("/api/v1/webhooks", webhookRoutes);
 
 // Serve uploaded files (avatars)
-app.use("/uploads", express.static("uploads"));
+app.use(
+  "/uploads/avatars",
+  express.static(publicAvatarDirectory, { dotfiles: "deny", index: false })
+);
 
 // ─── Scalar API documentation ───────────────────────────────────
 app.get("/api/docs/openapi.json", (_req, res) => {

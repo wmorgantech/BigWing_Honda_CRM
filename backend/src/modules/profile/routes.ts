@@ -1,12 +1,14 @@
 import { Router } from "express";
 import multer from "multer";
 import path from "path";
+import { mkdir } from "fs";
 import bcrypt from "bcrypt";
 import { z } from "zod";
 import { prisma } from "@bigwing/db";
 import { authMiddleware } from "../../middlewares/auth.js";
 import { validate } from "../../middlewares/validate.js";
 import { AppError } from "../../middlewares/errorHandler.js";
+import { publicAvatarDirectory } from "../../config/uploads.js";
 
 const router = Router();
 
@@ -30,7 +32,11 @@ function formatUser(u: any) {
 
 // Multer setup for avatar uploads
 const storage = multer.diskStorage({
-  destination: "uploads/avatars",
+  destination: (_req, _file, callback) => {
+    mkdir(publicAvatarDirectory, { recursive: true }, (error) => {
+      callback(error, publicAvatarDirectory);
+    });
+  },
   filename: (req, file, cb) => {
     const ts = Date.now();
     const ext = path.extname(file.originalname).toLowerCase();

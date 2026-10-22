@@ -34,29 +34,57 @@ pnpm db:seed
 pnpm dev
 ```
 
-## Local IIS Deployment
+## IIS Deployment Checklist
 
-1. Install IIS with Static Content, plus the IIS URL Rewrite and Application
-   Request Routing (ARR) modules. Enable ARR proxying at the server level.
-2. Set `backend/.env` for production: `NODE_ENV=production`, `PORT=3005`, the
-   remote PostgreSQL `DATABASE_URL`, and unique `JWT_SECRET` and
-    `JWT_REFRESH_SECRET` values of at least 32 characters. Set `CORS_ORIGIN` to
-    the site's origin (for example, `https://crm.example.com`). Keep secrets
-    out of source control. Set `REDIS_URL` if Redis is used.
-3. Set the same `DATABASE_URL` in `backend/db/.env` for Prisma commands. Check
-   migration status before any deployment migration; do not run migrations
-   without approval and a database backup.
-4. From the project root run `npm run build`. This writes the frontend to
-   `frontend/dist` and the API to `backend/dist`. Production frontend requests
-   use the same-origin `/api/v1` path.
-5. Run `node dist/server.js` as a Windows service with its working directory
-   set to `backend`. Keep port 3005 restricted to local machine traffic.
-6. Create an IIS site whose physical path is `frontend/dist`. The included
-   `web.config` proxies `/api/*` and `/uploads/*` to `127.0.0.1:3005`, allows
-   request bodies up to 100 MiB, and falls back to `index.html` for SPA routes.
-   Bind the site to the desired hostname and HTTPS certificate.
-7. Verify the API directly at `http://127.0.0.1:3005/api/health`, then verify
-   it through IIS at `https://<your-hostname>/api/health`.
+The repository does not contain the production DNS records or IIS site bindings.
+Before deployment, record and verify the existing BigWing and RedWing hostnames
+and site names; do not substitute the example hostnames from older notes.
+
+| Brand/site | Existing IIS site name | Existing HTTPS hostname |
+| --- | --- | --- |
+| BigWing | Verify on the IIS host | Verify DNS and IIS binding |
+| RedWing | Verify on the IIS host | Verify DNS and IIS binding |
+
+### Host and application
+
+- [ ] Confirm the hostnames above resolve to the production IIS host and that
+  each existing IIS site has an HTTPS binding and valid certificate.
+- [ ] Install IIS Static Content, URL Rewrite, and Application Request Routing
+  (ARR); enable ARR proxying at the server level.
+- [ ] Build from the project root with `npm run build`. The production frontend
+  build sets `VITE_API_URL=/api/v1`; its built bundle must not contain a direct
+  external HTTP API fallback.
+- [ ] Point each IIS site's physical path to `frontend/dist`. The included
+  rewrite rules serve SPA routes and proxy `/api/*` and `/uploads/*` to
+  `127.0.0.1:3005`. Confirm the production backend listens only on loopback or
+  is otherwise firewalled from public access.
+- [ ] Run `node dist/server.js` as a Windows service with working directory
+  `backend` and `NODE_ENV=production`.
+- [ ] Set `PORT=3005`, `DATABASE_URL`, `JWT_SECRET`, `JWT_REFRESH_SECRET`,
+  `CORS_ORIGIN`, and `UPLOADS_DIR` in the service environment. The database URL
+  is required; JWT secrets must each be at least 32 characters. Set the
+  `CORS_ORIGIN` to the exact browser origin if requests are cross-origin; with
+  same-origin IIS proxying, browser API calls remain on each site's origin.
+  Optional validated settings are `JWT_EXPIRES_IN`,
+  `JWT_REFRESH_EXPIRES_IN`, `REDIS_URL`, `RATE_LIMIT_WINDOW_MS`, and
+  `RATE_LIMIT_MAX`. Never put production values in source control.
+- [ ] Set `UPLOADS_DIR` to a persistent absolute directory outside replaceable
+  release folders. Grant the backend service identity read/write access there;
+  grant IIS read access only to the `avatars` subdirectory. Import spreadsheets
+  are stored under `private/imports` and must not be exposed as static files.
+  Plan backups, retention, and disk-space monitoring.
+- [ ] Confirm PostgreSQL is reachable from the backend host, the production
+  database and least-privilege account exist, TLS/network access is configured,
+  and a tested backup is available. The repository currently has no Prisma
+  migration history; resolve schema deployment separately before any database
+  changes.
+- [ ] Verify `http://127.0.0.1:3005/api/health` on the host and then
+  `https://<verified-existing-hostname>/api/health` through each IIS site.
+  Test login, authenticated APIs, avatar delivery, and denial of unauthenticated
+  and cross-brand import-file downloads.
+
+No production IIS host, hostname, certificate, ARR configuration, service
+identity, or PostgreSQL connection has been verified by this local checklist.
 
 ## Project Structure
 

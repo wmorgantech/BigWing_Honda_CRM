@@ -19,6 +19,7 @@ function requiredPassword(): string {
 
 async function main() {
   const email = 'redwing@bigwing.in';
+  const username = 'redwing-admin';
   
   // Check if exists
   let user = await prisma.user.findUnique({ where: { email } });
@@ -29,6 +30,7 @@ async function main() {
     
     user = await prisma.user.create({
       data: {
+        username,
         email,
         password: hashedPassword,
         fullName: 'Redwing Admin',

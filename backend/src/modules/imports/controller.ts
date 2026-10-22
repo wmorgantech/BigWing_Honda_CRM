@@ -1,6 +1,8 @@
 import { Request, Response, NextFunction } from "express";
 import { importService } from "./service.js";
 import { brandContext } from "../../middlewares/brand.js";
+import { existsSync } from "fs";
+import { getImportFilePath } from "./storage.js";
 
 export class ImportController {
   async upload(req: Request, res: Response, next: NextFunction) {
@@ -126,7 +128,17 @@ export class ImportController {
         res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: "Batch not found" } });
         return;
       }
-      res.download(`uploads/${batch.fileName}`);
+      const filePath = getImportFilePath(batch.fileName);
+      if (!existsSync(filePath)) {
+        res.status(404).json({
+          success: false,
+          error: { code: "FILE_NOT_FOUND", message: "Import file not found" },
+        });
+        return;
+      }
+      res.download(filePath, batch.fileName, (err) => {
+        if (err && !res.headersSent) next(err);
+      });
     } catch (err) {
       next(err);
     }

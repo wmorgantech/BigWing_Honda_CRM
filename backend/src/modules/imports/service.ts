@@ -6,6 +6,7 @@ import { prisma } from "@bigwing/db";
 import { importRepository } from "./repository.js";
 import { AppError } from "../../middlewares/errorHandler.js";
 import { brandContext } from "../../middlewares/brand.js";
+import { getImportFilePath } from "./storage.js";
 import {
   normalizeMobile,
   normalizeDate,
@@ -211,7 +212,7 @@ export class ImportService {
     const batch = await importRepository.findBatchById(batchId);
     if (!batch) throw new AppError(404, "BATCH_NOT_FOUND", "Import batch not found");
 
-    const filePath = `uploads/${batch.fileName}`;
+    const filePath = getImportFilePath(batch.fileName);
     const parsed = this.parseFile(filePath, sheetName);
 
     const previewRows = parsed.slice(0, 50).map((r) => ({
@@ -246,7 +247,7 @@ export class ImportService {
       startedAt: new Date(),
     });
 
-    const filePath = `uploads/${batch.fileName}`;
+    const filePath = getImportFilePath(batch.fileName);
     const parsed = this.parseFile(filePath, sheetName);
 
     // Load master data lookups
@@ -592,7 +593,7 @@ export class ImportService {
 
     let dbErrors = await importRepository.getRowErrors(batchId);
 
-    const filePath = `uploads/${batch.fileName}`;
+    const filePath = getImportFilePath(batch.fileName);
     let allRows: ParsedRow[] = [];
     try {
       allRows = this.parseFile(filePath);
@@ -1403,5 +1404,4 @@ export class ImportService {
 }
 
 export const importService = new ImportService();
-
 
